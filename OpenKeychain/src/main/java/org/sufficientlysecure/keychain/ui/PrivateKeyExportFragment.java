@@ -21,7 +21,6 @@ import android.widget.TextView;
 
 import com.cryptolib.SecureDataSocket;
 import com.cryptolib.SecureDataSocketException;
-import com.cryptolib.UnverifiedException;
 
 import org.sufficientlysecure.keychain.Constants;
 import org.sufficientlysecure.keychain.R;
@@ -41,7 +40,6 @@ import java.util.Collections;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
-import java.util.concurrent.Semaphore;
 
 public class PrivateKeyExportFragment extends CryptoOperationFragment<BackupKeyringParcel, ExportResult> {
     public static final String ARG_MASTER_KEY_IDS = "master_key_ids";
@@ -55,16 +53,12 @@ public class PrivateKeyExportFragment extends CryptoOperationFragment<BackupKeyr
 
     private Activity mActivity;
     private SecureDataSocket mSecureDataSocket;
-    private InitSocketTask mInitSocketTask;
+    private SetupServerWithClientCameraTask mSetupServerTask;
+    private SetupServerNoClientCameraTask mSetupServerNoCamTask;
     private String mIpAddress;
     private String mConnectionDetails;
     private long mMasterKeyId;
     private Uri mCachedBackupUri;
-    private boolean mReconnectWithoutQrCode;
-
-    private Semaphore mLock = new Semaphore(0);
-    private boolean mSentencesMatched;
-    private String mPhrase = "";
 
     public static PrivateKeyExportFragment newInstance(long masterKeyId) {
         PrivateKeyExportFragment frag = new PrivateKeyExportFragment();
@@ -76,32 +70,70 @@ public class PrivateKeyExportFragment extends CryptoOperationFragment<BackupKeyr
         return frag;
     }
 
+    /**
+     * from: http://stackoverflow.com/a/13007325
+     * <p>
+     * Get IP address from first non-localhost interface
+     *
+     * @param useIPv4 true=return ipv4, false=return ipv6
+     * @return address or empty string
+     */
+    private static String getIPAddress(boolean useIPv4) {
+        try {
+            List<NetworkInterface> interfaces = Collections.list(NetworkInterface.getNetworkInterfaces());
+            for (NetworkInterface intf : interfaces) {
+                List<InetAddress> addrs = Collections.list(intf.getInetAddresses());
+                for (InetAddress addr : addrs) {
+                    if (!addr.isLoopbackAddress()) {
+                        String sAddr = addr.getHostAddress();
+                        //boolean isIPv4 = InetAddressUtils.isIPv4Address(sAddr);
+                        boolean isIPv4 = sAddr.indexOf(':') < 0;
+
+                        if (useIPv4) {
+                            if (isIPv4)
+                                return sAddr;
+                        } else {
+                            if (!isIPv4) {
+                                int delim = sAddr.indexOf('%'); // drop ip6 zone suffix
+                                return delim < 0 ? sAddr.toUpperCase() : sAddr.substring(0, delim).toUpperCase();
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (Exception ex) {
+        } // for now eat exceptions
+        return "";
+    }
+
     @Override
     public void onAttach(Context context) {
-        super.onAttach(context);
-
         mActivity = (Activity) context;
         mIpAddress = getIPAddress(true);
+        super.onAttach(context);
     }
 
     @Override
     public void onResume() {
+        System.out.println("**DEBUG: onResume()");
+        mSetupServerTask = new SetupServerWithClientCameraTask();
+        mSetupServerTask.execute();
         super.onResume();
-
-        mInitSocketTask = new InitSocketTask();
-        mInitSocketTask.execute();
     }
 
     @Override
     public void onPause() {
-        super.onPause();
-
-        if (mInitSocketTask != null) {
-            mInitSocketTask.cancel(true);
+        System.out.println("**DEBUG: onPause()");
+        if (mSetupServerTask != null) {
+            mSetupServerTask.cancel(true);
+        }
+        if (mSetupServerNoCamTask != null) {
+            mSetupServerNoCamTask.cancel(true);
         }
         if (mSecureDataSocket != null) {
             mSecureDataSocket.close();
         }
+        super.onPause();
     }
 
     @Override
@@ -113,7 +145,7 @@ public class PrivateKeyExportFragment extends CryptoOperationFragment<BackupKeyr
 
         final View qrLayout = view.findViewById(R.id.private_key_export_qr_layout);
         mQrCode = (ImageView) view.findViewById(R.id.private_key_export_qr_image);
-        final Button button = (Button) view.findViewById(R.id.private_key_export_button);
+        final Button doesntWorkButton = (Button) view.findViewById(R.id.private_key_export_button);
 
         final View infoLayout = view.findViewById(R.id.private_key_export_info_layout);
         TextView ipText = (TextView) view.findViewById(R.id.private_key_export_ip);
@@ -126,22 +158,27 @@ public class PrivateKeyExportFragment extends CryptoOperationFragment<BackupKeyr
         mQrCode.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View view) {
+                System.out.println("**DEBUG: QR KLICK");
                 showQrCodeDialog();
             }
         });
 
-        button.setOnClickListener(new View.OnClickListener() {
+        doesntWorkButton.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View view) {
-                mReconnectWithoutQrCode = true;
+                if (mSetupServerTask != null) {
+                    mSetupServerTask.cancel(true);
+                }
                 if (mSecureDataSocket != null) {
                     mSecureDataSocket.close();
                 }
 
                 qrLayout.setVisibility(View.GONE);
-                button.setVisibility(View.GONE);
+                doesntWorkButton.setVisibility(View.GONE);
 
                 infoLayout.setVisibility(View.VISIBLE);
+                mSetupServerNoCamTask = new SetupServerNoClientCameraTask();
+                mSetupServerNoCamTask.execute();
             }
         });
 
@@ -151,16 +188,26 @@ public class PrivateKeyExportFragment extends CryptoOperationFragment<BackupKeyr
         mNoButton.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View view) {
-                mSentencesMatched = false;
-                mLock.release();
+                try {
+                    mSecureDataSocket.comparedPhrases(false);
+                } catch (SecureDataSocketException e) {
+                    e.printStackTrace();
+                }
+                mActivity.finish();
             }
         });
 
         mYesButton.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View view) {
-                mSentencesMatched = true;
-                mLock.release();
+                try {
+                    mSecureDataSocket.comparedPhrases(true);
+                    System.out.println("**DEBUG: createExport 2");
+                    createExport();
+                } catch (SecureDataSocketException e) {
+                    System.out.println("mSecureDataSocket.comparedPhrases(true);");
+                    e.printStackTrace();
+                }
             }
         });
 
@@ -168,99 +215,6 @@ public class PrivateKeyExportFragment extends CryptoOperationFragment<BackupKeyr
 
         return view;
     }
-
-    private class InitSocketTask extends AsyncTask<Void, Void, String> {
-        protected String doInBackground(Void... unused) {
-            String connectionDetails = null;
-
-            try {
-                mSecureDataSocket = new SecureDataSocket(PORT);
-                connectionDetails = mSecureDataSocket.prepareServerWithClientCamera();
-            } catch (SecureDataSocketException e) {
-                e.printStackTrace();
-            }
-
-            return connectionDetails;
-        }
-
-        protected void onPostExecute(String connectionDetails) {
-            if (isCancelled()  ||isRemoving()) {
-                return;
-            }
-
-            mConnectionDetails = connectionDetails;
-            loadQrCode();
-            new Thread(mSecureConnection).start();
-        }
-    };
-
-    private Runnable mSecureConnection = new Runnable() {
-        @Override
-        public void run() {
-
-            try {
-                mSecureDataSocket.setupServerWithClientCamera();
-            } catch (SecureDataSocketException e) {
-                e.printStackTrace();
-            }
-
-            if (!mReconnectWithoutQrCode) {
-                mActivity.runOnUiThread(new Runnable() {
-                    @Override
-                    public void run() {
-                        createExport();
-                    }
-                });
-                return;
-            }
-
-            try {
-                mPhrase = mSecureDataSocket.setupServerNoClientCamera();
-            } catch (SecureDataSocketException e) {
-                e.printStackTrace();
-            }
-
-            mActivity.runOnUiThread(new Runnable() {
-                @Override
-                public void run() {
-                    mSentenceHeadlineText.setVisibility(View.VISIBLE);
-                    mSentenceText.setVisibility(View.VISIBLE);
-                    mNoButton.setVisibility(View.VISIBLE);
-                    mYesButton.setVisibility(View.VISIBLE);
-
-                    mSentenceText.setText(mPhrase);
-                }
-            });
-
-            boolean interrupted;
-            do {
-                try {
-                    mLock.acquire();
-                    interrupted = false;
-                } catch (InterruptedException e) {
-                    interrupted = true;
-                    e.printStackTrace();
-                }
-            } while (interrupted);
-
-            try {
-                mSecureDataSocket.comparedPhrases(mSentencesMatched);
-            } catch (SecureDataSocketException e) {
-                e.printStackTrace();
-            }
-
-            if (mSentencesMatched) {
-                mActivity.runOnUiThread(new Runnable() {
-                    @Override
-                    public void run() {
-                        createExport();
-                    }
-                });
-            } else {
-                mActivity.finish();
-            }
-        }
-    };
 
     private void showQrCodeDialog() {
         Intent qrCodeIntent = new Intent(mActivity, QrCodeViewActivity.class);
@@ -308,7 +262,6 @@ public class PrivateKeyExportFragment extends CryptoOperationFragment<BackupKeyr
                         mQrCode.startAnimation(anim);
                     }
                 };
-
         loadTask.execute();
     }
 
@@ -331,6 +284,7 @@ public class PrivateKeyExportFragment extends CryptoOperationFragment<BackupKeyr
                 try {
                     byte[] exportData = FileHelper.readBytesFromUri(mActivity, mCachedBackupUri);
                     mSecureDataSocket.write(exportData);
+                    mSecureDataSocket.close();
                     mActivity.finish();
                 } catch (IOException | SecureDataSocketException e) {
                     e.printStackTrace();
@@ -339,48 +293,15 @@ public class PrivateKeyExportFragment extends CryptoOperationFragment<BackupKeyr
         }).start();
     }
 
-    /**
-     * from: http://stackoverflow.com/a/13007325
-     *
-     * Get IP address from first non-localhost interface
-     * @param useIPv4  true=return ipv4, false=return ipv6
-     * @return  address or empty string
-     */
-    private static String getIPAddress(boolean useIPv4) {
-        try {
-            List<NetworkInterface> interfaces = Collections.list(NetworkInterface.getNetworkInterfaces());
-            for (NetworkInterface intf : interfaces) {
-                List<InetAddress> addrs = Collections.list(intf.getInetAddresses());
-                for (InetAddress addr : addrs) {
-                    if (!addr.isLoopbackAddress()) {
-                        String sAddr = addr.getHostAddress();
-                        //boolean isIPv4 = InetAddressUtils.isIPv4Address(sAddr);
-                        boolean isIPv4 = sAddr.indexOf(':')<0;
-
-                        if (useIPv4) {
-                            if (isIPv4)
-                                return sAddr;
-                        } else {
-                            if (!isIPv4) {
-                                int delim = sAddr.indexOf('%'); // drop ip6 zone suffix
-                                return delim<0 ? sAddr.toUpperCase() : sAddr.substring(0, delim).toUpperCase();
-                            }
-                        }
-                    }
-                }
-            }
-        } catch (Exception ex) { } // for now eat exceptions
-        return "";
-    }
-
     @Nullable
     @Override
     public BackupKeyringParcel createOperationInput() {
-        return new BackupKeyringParcel(new long[] {mMasterKeyId}, true, false, mCachedBackupUri);
+        return new BackupKeyringParcel(new long[]{mMasterKeyId}, true, false, mCachedBackupUri);
     }
 
     @Override
     public void onCryptoOperationSuccess(ExportResult result) {
+        System.out.println("**DEBUG: createExport 3");
         createExport();
     }
 
@@ -393,5 +314,83 @@ public class PrivateKeyExportFragment extends CryptoOperationFragment<BackupKeyr
     @Override
     public void onCryptoOperationCancelled() {
         mCachedBackupUri = null;
+    }
+
+    private class SetupServerWithClientCameraTask extends AsyncTask<Void, Void, Void> {
+        @Override
+        protected void onPreExecute() {
+            mSecureDataSocket = new SecureDataSocket(PORT);
+            try {
+                mConnectionDetails = mSecureDataSocket.prepareServerWithClientCamera();
+            } catch (SecureDataSocketException e) {
+                e.printStackTrace();
+            }
+            System.out.println("**DEBUG: " + mConnectionDetails);
+            loadQrCode();
+            super.onPreExecute();
+        }
+
+        @Override
+        protected Void doInBackground(Void... unused) {
+            System.out.println("**DEBUG: SetupServerWithClientCameraTask.doInBackground()");
+            try {
+                mSecureDataSocket.setupServerWithClientCamera();
+            } catch (SecureDataSocketException e) {
+                if (!e.getMessage().contains("Socket closed")) e.printStackTrace();
+                else System.out.println("**DEBUG: Socket was closed");
+            }
+            return null;
+        }
+
+        @Override
+        protected void onPostExecute(Void voidValue) {
+            System.out.println("**DEBUG: SetupServerWithClientCameraTask.onPostExecute()");
+            System.out.println("**DEBUG: createExport 1");
+            createExport();
+            super.onPostExecute(voidValue);
+        }
+
+        @Override
+        protected void onCancelled() {
+            System.out.println("**DEBUG: CANCELED: SetupServerWithClientCameraTask");
+            super.onCancelled();
+        }
+    }
+
+    private class SetupServerNoClientCameraTask extends AsyncTask<Void, Void, String> {
+        @Override
+        protected void onPreExecute() {
+            mSecureDataSocket = new SecureDataSocket(PORT);
+            super.onPreExecute();
+        }
+
+        @Override
+        protected String doInBackground(Void... unused) {
+            try {
+                return mSecureDataSocket.setupServerNoClientCamera();
+            } catch (SecureDataSocketException e) {
+                // possible that NullPointerException gets thrown when it's actually Socket closed
+                if (!e.getMessage().contains("Socket closed")) e.printStackTrace();
+                else System.out.println("**DEBUG: Socket was closed");
+            }
+            return "ERROR: Could not retrieve Sentence. Please try again.";
+        }
+
+        @Override
+        protected void onPostExecute(String mPhrase) {
+            mSentenceHeadlineText.setVisibility(View.VISIBLE);
+            mSentenceText.setVisibility(View.VISIBLE);
+            mNoButton.setVisibility(View.VISIBLE);
+            mYesButton.setVisibility(View.VISIBLE);
+            mSentenceText.setText(mPhrase);
+            super.onPostExecute(mPhrase);
+        }
+
+        @Override
+        protected void onCancelled() {
+            System.out.println("**DEBUG: CANCELED: SetupServerNoClientCameraTask");
+            mActivity.finish();
+            super.onCancelled();
+        }
     }
 }
